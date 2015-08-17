@@ -1,41 +1,38 @@
-<?php
-
-/*
- * This file is part of jwt-auth
- *
- * (c) Sean Tymon <tymon148@gmail.com>
- *
- * For the full copyright and license information, please view the LICENSE
- * file that was distributed with this source code.
- */
-
-namespace Tymon\JWTAuth;
+<?php namespace Tymon\JWTAuth;
 
 use Illuminate\Http\Request;
-use Tymon\JWTAuth\Support\CustomClaims;
-use Tymon\JWTAuth\Contracts\JWTSubject;
-use Tymon\JWTAuth\Contracts\Providers\Auth;
 use Tymon\JWTAuth\Exceptions\JWTException;
-use Tymon\JWTAuth\Http\TokenParser;
+use Tymon\JWTAuth\Providers\Auth\AuthInterface;
+use Tymon\JWTAuth\Providers\User\UserInterface;
+use App\Services\Auth\JWTAuthAdapter;
 
 class JWTAuth
 {
-    use CustomClaims;
-
     /**
-     * @var \Tymon\JWTAuth\Manager
+     * @var \Tymon\JWTAuth\JWTManager
      */
     protected $manager;
 
     /**
-     * @var \Tymon\JWTAuth\Contracts\Providers\Auth
+     * @var \Tymon\JWTAuth\Providers\User\UserInterface
+     */
+    protected $user;
+
+    /**
+     * @var \Tymon\JWTAuth\Providers\Auth\AuthInterface
+     * @var(po novem) App\Services\Auth\JWTAuthAdapter
      */
     protected $auth;
 
     /**
-     * @var \Tymon\JWTAuth\Http\TokenParser
+     * @var \Illuminate\Http\Request
      */
-    protected $parser;
+    protected $request;
+
+    /**
+     * @var string
+     */
+    protected $identifier = 'id';
 
     /**
      * @var \Tymon\JWTAuth\Token
@@ -43,27 +40,49 @@ class JWTAuth
     protected $token;
 
     /**
-     * @param \Tymon\JWTAuth\Manager                   $manager
-     * @param \Tymon\JWTAuth\Contracts\Providers\Auth  $auth
-     * @param \Tymon\JWTAuth\Http\TokenParser          $parser
+     * @param \Tymon\JWTAuth\JWTManager                   $manager
+     * @param \Tymon\JWTAuth\Providers\User\UserInterface $user
+     * @param \Tymon\JWTAuth\Providers\Auth\AuthInterface $auth
+     * @param (po novem) App\Services\Auth\JWTAuthAdapter $auth
+     * @param \Illuminate\Http\Request                    $request
      */
-    public function __construct(Manager $manager, Auth $auth, TokenParser $parser)
+    public function __construct(JWTManager $manager, UserInterface $user, JWTAuthAdapter $auth, Request $request)
     {
         $this->manager = $manager;
+        $this->user = $user;
         $this->auth = $auth;
-        $this->parser = $parser;
+        $this->request = $request;
+    }
+
+    /**
+     * Find a user using the user identifier in the subject claim.
+     *
+     * @param bool|string $token
+     *
+     * @return mixed
+     */
+    public function toUser($token = false)
+    {
+        $payload = $this->getPayload($token);
+
+        if (! $user = $this->user->getBy($this->$identifier, $payload['sub'])) {
+            return false;
+        }
+
+        return $user;
     }
 
     /**
      * Generate a token using the user identifier as the subject claim.
      *
-     * @param \Tymon\JWTAuth\Contracts\JWTSubject $user
+     * @param mixed $user
+     * @param array $customClaims
      *
-     * @return string
+     * @return string (token)
      */
-    public function fromUser(JWTSubject $user)
+    public function fromUser($user, array $customClaims = [])
     {
-        $payload = $this->makePayload($user);
+        $payload = $this->makePayload($user->{$this->identifier}, $customClaims);
 
         return $this->manager->encode($payload)->get();
     }
@@ -72,102 +91,72 @@ class JWTAuth
      * Attempt to authenticate the user and return the token.
      *
      * @param array $credentials
+     * @param array $customClaims
      *
      * @return false|string
      */
-    public function attempt(array $credentials)
+    public function attempt(array $credentials = [], array $customClaims = [])
     {
         if (! $this->auth->byCredentials($credentials)) {
             return false;
         }
 
-        return $this->fromUser($this->user());
+        return $this->fromUser($this->auth->user(), $customClaims);
     }
 
     /**
      * Authenticate a user via a token.
      *
-     * @return \Tymon\JWTAuth\Contracts\JWTSubject|false
+     * @param mixed $token
+     *
+     * @return mixed
      */
-    public function authenticate()
+    public function authenticate($token = false)
     {
-        $id = $this->getPayload()->get('sub');
+        $id = $this->getPayload($token)->get('sub');
 
         if (! $this->auth->byId($id)) {
             return false;
         }
 
-        return $this->user();
-    }
-
-    /**
-     * Alias for authenticate().
-     *
-     * @return \Tymon\JWTAuth\Contracts\JWTSubject|false
-     */
-    public function toUser()
-    {
-        return $this->authenticate();
+        //return $this->auth->user()
+        // POGLEJ, KAJ JE TA FUNKCIJA $this->auth->user()
+        //dd($this->auth->byId($id));
+        return $this->auth->byId($id);
     }
 
     /**
      * Refresh an expired token.
      *
+     * @param mixed $token
+     *
      * @return string
      */
-    public function refresh()
+    public function refresh($token = false)
     {
-        $this->requireToken();
+        $this->requireToken($token);
 
-        return $this->manager->customClaims($this->customClaims)->refresh($this->token)->get();
+        return $this->manager->refresh($this->token)->get();
     }
 
     /**
      * Invalidate a token (add it to the blacklist).
      *
+     * @param mixed $token
+     *
      * @return boolean
      */
-    public function invalidate()
+    public function invalidate($token = false)
     {
-        $this->requireToken();
+        $this->requireToken($token);
 
         return $this->manager->invalidate($this->token);
     }
 
     /**
-     * Alias to get the payload
-     * And as a result checks that the token is valid
-     * i.e. not expired or blacklisted
-     *
-     * @throws JWTException
-     *
-     * @return \Tymon\JWTAuth\Payload
-     */
-    public function checkOrFail()
-    {
-        return $this->getPayload();
-    }
-
-    /**
-     * Check that the token is valid
-     *
-     * @return boolean
-     */
-    public function check()
-    {
-        try {
-            $this->checkOrFail();
-        } catch (JWTException $e) {
-            return false;
-        }
-
-        return true;
-    }
-
-    /**
      * Get the token.
      *
-     * @return false|Token
+     * @return boolean|string
      */
     public function getToken()
     {
@@ -183,69 +172,94 @@ class JWTAuth
     }
 
     /**
-     * Parse the token from the request.
-     *
-     * @throws \Tymon\JWTAuth\Exceptions\JWTException
-     *
-     * @return JWTAuth
-     */
-    public function parseToken()
-    {
-        if (! $token = $this->parser->parseToken()) {
-            throw new JWTException('The token could not be parsed from the request', 400);
-        }
-
-        return $this->setToken($token);
-    }
-
-    /**
      * Get the raw Payload instance.
+     *
+     * @param mixed $token
      *
      * @return \Tymon\JWTAuth\Payload
      */
-    public function getPayload()
+    public function getPayload($token = false)
     {
-        $this->requireToken();
+        $this->requireToken($token);
 
         return $this->manager->decode($this->token);
     }
 
     /**
-     * Create a Payload instance.
+     * Parse the token from the request.
      *
-     * @param \Tymon\JWTAuth\Contracts\JWTSubject $user
+     * @param string $query
      *
-     * @return \Tymon\JWTAuth\Payload
+     * @return JWTAuth
      */
-    public function makePayload(JWTSubject $user)
-    {
-        return $this->factory()->customClaims($this->getClaimsArray($user))->make();
+    public function parseToken($method = 'bearer', $header = 'authorization', $query = 'token')
+    {   
+        //dd($this->request->header());
+        //dd($this->parseAuthHeader($header, $method));
+        if (! $token = $this->parseAuthHeader($header, $method)) {
+            if (! $token = $this->request->query($query, false)) {
+                throw new JWTException('The token could not be parsed from the request', 400);
+            }
+        }
+        return $this->setToken($token);
     }
 
     /**
-     * Build the claims array and return it
+     * Parse token from the authorization header.
      *
-     * @param \Tymon\JWTAuth\Contracts\JWTSubject $user
+     * @param string $header
+     * @param string $method
      *
-     * @return array
+     * @return false|string
      */
-    protected function getClaimsArray(JWTSubject $user)
+    protected function parseAuthHeader($header = 'authorization', $method = 'bearer')
     {
-        return array_merge(
-            $this->customClaims,
-            $user->getJWTCustomClaims(),
-            ['sub' => $user->getJWTIdentifier()]
+        $header = $this->request->headers->get($header);
+
+        if (! starts_with(strtolower($header), $method)) {
+            return false;
+        }
+
+        return trim(str_ireplace($method, '', $header));
+    }
+
+    /**
+     * Create a Payload instance.
+     *
+     * @param mixed $subject
+     * @param array $customClaims
+     *
+     * @return \Tymon\JWTAuth\Payload
+     */
+    protected function makePayload($subject, array $customClaims = [])
+    {
+        return $this->manager->getPayloadFactory()->make(
+            array_merge($customClaims, ['sub' => $subject])
         );
     }
 
     /**
-     * Get the authenticated user
+     * Set the identifier.
      *
-     * @return \Tymon\JWTAuth\Contracts\JWTSubject
+     * @param string $identifier
+     *
+     * @return $this
      */
-    public function user()
+    public function setIdentifier($identifier)
     {
-        return $this->auth->user();
+        $this->$identifier = $identifier;
+
+        return $this;
+    }
+
+    /**
+     * Get the identifier.
+     *
+     * @return string
+     */
+    public function getIdentifier()
+    {
+        return $this->identifier;
     }
 
     /**
@@ -253,7 +267,7 @@ class JWTAuth
      *
      * @param string $token
      *
-     * @return JWTAuth
+     * @return $this
      */
     public function setToken($token)
     {
@@ -265,57 +279,41 @@ class JWTAuth
     /**
      * Ensure that a token is available.
      *
+     * @param mixed $token
+     *
+     * @return JWTAuth
+     *
      * @throws \Tymon\JWTAuth\Exceptions\JWTException
      */
-    protected function requireToken()
+    protected function requireToken($token)
     {
-        if (! $this->token) {
+        if (! $token = $token ?: $this->token) {
             throw new JWTException('A token is required', 400);
         }
+
+        return $this->setToken($token);
     }
 
     /**
      * Set the request instance.
      *
-     * @param \Illuminate\Http\Request $request
-     *
-     * @return JWTAuth
+     * @param Request $request
      */
     public function setRequest(Request $request)
     {
-        $this->parser->setRequest($request);
+        $this->request = $request;
 
         return $this;
     }
 
     /**
-     * Get the Manager instance.
+     * Get the JWTManager instance.
      *
-     * @return \Tymon\JWTAuth\Manager
+     * @return \Tymon\JWTAuth\JWTManager
      */
     public function manager()
     {
         return $this->manager;
-    }
-
-    /**
-     * Get the Payload Factory
-     *
-     * @return \Tymon\JWTAuth\Factory
-     */
-    public function factory()
-    {
-        return $this->manager->getPayloadFactory();
-    }
-
-    /**
-     * Get the TokenParser instance
-     *
-     * @return \Tymon\JWTAuth\Http\TokenParser
-     */
-    public function parser()
-    {
-        return $this->parser;
     }
 
     /**
